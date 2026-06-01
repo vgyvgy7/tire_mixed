@@ -38,8 +38,9 @@ def parse_specs(multiline_text: str):
     return tires, errors
 
 
-def container_wireframe(container: Container):
+def container_wireframe(container: Container, offset_x: float = 0.0, name: str = "Container"):
     corners = np.array(list(itertools.product([0, container.length_mm], [0, container.width_mm], [0, container.height_mm])))
+    corners[:, 0] += offset_x
     xw, yw, zw = [], [], []
     for s, e in combinations(corners, 2):
         if np.sum(np.abs(s - e)) in [container.length_mm, container.width_mm, container.height_mm]:
@@ -52,7 +53,7 @@ def container_wireframe(container: Container):
         z=zw,
         mode="lines",
         line=dict(color="rgba(15,23,42,0.28)", width=2),
-        name="Container",
+        name=name,
         showlegend=False,
         hoverinfo="none",
     )
@@ -118,9 +119,11 @@ def cylinder_batch(items):
     return np.array(ax), np.array(ay), np.array(az), ai, aj, ak
 
 
-def build_3d(container: Container, placements, title: str):
+def build_3d(container: Container, placements, title: str, container_count: int = 1):
     fig = go.Figure()
-    fig.add_trace(container_wireframe(container))
+    gap = max(container.length_mm * 0.08, 800)
+    for idx in range(container_count):
+        fig.add_trace(container_wireframe(container, idx * (container.length_mm + gap), f"Container {idx + 1}"))
     df = pd.DataFrame(placements)
     if not df.empty:
         for spec, group in df.groupby("tire_spec", sort=False):
@@ -147,7 +150,7 @@ def build_3d(container: Container, placements, title: str):
     fig.update_layout(
         title=dict(text=f"<b>{title}</b> | placement count: {len(placements):,}", font=dict(size=14, color="#0F172A")),
         scene=dict(
-            xaxis=dict(title="Length X (mm)", range=[0, container.length_mm], backgroundcolor="rgba(241,245,249,0.7)", gridcolor="#CBD5E1"),
+            xaxis=dict(title="Length X (mm)", range=[0, container.length_mm * container_count + gap * max(0, container_count - 1)], backgroundcolor="rgba(241,245,249,0.7)", gridcolor="#CBD5E1"),
             yaxis=dict(title="Width Y (mm)", range=[0, container.width_mm], backgroundcolor="rgba(248,250,252,0.7)", gridcolor="#CBD5E1"),
             zaxis=dict(title="Height Z (mm)", range=[0, container.height_mm], backgroundcolor="rgba(255,255,255,0.7)", gridcolor="#CBD5E1"),
             aspectmode="data",
@@ -159,6 +162,21 @@ def build_3d(container: Container, placements, title: str):
         paper_bgcolor="#FAFAFA",
     )
     return fig
+
+
+def offset_visual_placements(container: Container, main_placements, overflow_placements):
+    gap = max(container.length_mm * 0.08, 800)
+    visual = [dict(p, container_no=int(p.get("container_no", 1))) for p in main_placements]
+    for p in overflow_placements:
+        item = dict(p)
+        container_no = int(item.get("container_no", 2))
+        offset = (container_no - 1) * (container.length_mm + gap)
+        for key in ("x", "bbox_x0", "bbox_x1", "block_start_x", "block_end_x"):
+            if key in item:
+                item[key] = float(item[key]) + offset
+        visual.append(item)
+    container_count = max([int(p.get("container_no", 1)) for p in visual], default=1)
+    return visual, container_count
 
 
 def choose_segment(label, options, default=None, key=None):
@@ -321,7 +339,44 @@ with right:
     if mixed_df.empty:
         st.info("혼적 배분값을 입력하면 결과표가 생성됩니다.")
     else:
+        unplaced_total = int(mixed_result.get("unplaced_total") or 0)
+        first_container_unplaced_total = int(mixed_result.get("first_container_unplaced_total") or 0)
+        requested_total = mixed_result.get("requested_total")
+        dedicated_loaded_total = int(mixed_result.get("dedicated_loaded_total") or 0)
+        loaded_total = int(mixed_result.get("loaded_total") or mixed_result["total_count"])
+        if dedicated_loaded_total > 0:
+            st.info(f"단일 최대 적재량 기준으로 {dedicated_loaded_total:,}개는 단독 컨테이너로 분리하고, 잔량 {mixed_result['total_count']:,}개를 혼적 계산에 사용했습니다.")
+            explanation_lines = [
+                "혼적 개수 계산 방식",
+                f"- 선택 방식: {'평치' if method == 'flat' else '벌집'}",
+                "- 각 규격의 단일 최대 적재량을 먼저 계산합니다.",
+                "- 입력 수량이 단일 최대 적재량보다 크면, 최대 적재량 단위는 단독 컨테이너로 분리합니다.",
+                "- 단독 컨테이너에 들어가지 않고 남은 잔량만 현재 혼적 컨테이너에 배치합니다.",
+                "- 혼적 잔량은 수량이 많은 규격부터 배치합니다.",
+            ]
+            for _, row in mixed_df.iterrows():
+                original = int(row.get("original_requested_count") or 0)
+                capacity = int(row.get("single_spec_capacity") or 0)
+                dedicated_containers = int(row.get("dedicated_container_count") or 0)
+                dedicated_count = int(row.get("dedicated_count") or 0)
+                mixed_requested = int(row.get("mixed_requested_count") or 0)
+                mixed_count = int(row.get("count") or 0)
+                if original > 0:
+                    explanation_lines.append(
+                        f"- {row['tire_spec']}: 입력 {original:,}개 / 단일 최대 {capacity:,}개 / "
+                        f"단독 {dedicated_containers:,}대({dedicated_count:,}개) / "
+                        f"혼적 대상 {mixed_requested:,}개 / 실제 혼적 {mixed_count:,}개"
+                    )
+            st.markdown("\n".join(explanation_lines))
+        if first_container_unplaced_total > 0:
+            st.info(f"첫 번째 혼적 컨테이너에서 남은 {first_container_unplaced_total:,}개는 추가 컨테이너에 이어서 적재했습니다.")
+        if unplaced_total > 0:
+            st.warning(f"요청 {int(requested_total):,}개 중 총 {loaded_total:,}개 처리, {unplaced_total:,}개는 현재 컨테이너 구성에 미적재입니다.")
         st.dataframe(mixed_df, use_container_width=True, hide_index=True)
+        overflow_df = mixed_result.get("overflow_table", pd.DataFrame())
+        if isinstance(overflow_df, pd.DataFrame) and not overflow_df.empty:
+            st.markdown("추가 컨테이너 적재")
+            st.dataframe(overflow_df, use_container_width=True, hide_index=True)
 
 tabs = st.tabs(["3D 시각화", "Validation", "Excel / 보고서"])
 
@@ -330,18 +385,55 @@ with tabs[0]:
     placements = []
     title = "혼적 적재"
     expected_count = None
+    container_count = 1
     if mode == "혼적":
-        placements = mixed_result["placements"]
-        expected_count = int(mixed_result["total_count"])
+        placements, container_count = offset_visual_placements(
+            container,
+            mixed_result.get("placements", []),
+            mixed_result.get("overflow_placements", []),
+        )
+        expected_count = len(placements)
         title = f"혼적 적재 | {method_label}"
     elif adjusted_tires:
         selected = st.selectbox("단일 규격 선택", [t.spec for t in adjusted_tires])
         if selected in single_detail:
             key = "flat" if mode == "단일 규격 평치" else "honeycomb"
-            placements = single_detail[selected][key]["placements"]
-            expected_count = single_detail[selected][key]["count"]
-            title = f"{selected} | {'평치' if key == 'flat' else '벌집'}"
-    st.plotly_chart(build_3d(container, placements, title), use_container_width=True)
+            full_placements = single_detail[selected][key]["placements"]
+            capacity = int(single_detail[selected][key]["count"])
+            requested_single_count = int(st.number_input(
+                "단일 규격 요청 수량",
+                min_value=0,
+                value=capacity,
+                step=1,
+                key=f"single_requested_{selected}_{key}",
+            ))
+            if requested_single_count <= capacity:
+                visible_count = requested_single_count
+                completed_containers = 0
+            else:
+                remainder = requested_single_count % capacity
+                if remainder == 0:
+                    visible_count = capacity
+                    completed_containers = max(0, requested_single_count // capacity - 1)
+                else:
+                    visible_count = remainder
+                    completed_containers = requested_single_count // capacity
+            placements = full_placements[:visible_count]
+            expected_count = visible_count
+            method_text = "평치" if key == "flat" else "벌집"
+            title = f"{selected} | {method_text} | 마지막 컨테이너"
+            if requested_single_count > capacity:
+                st.info(
+                    f"{selected} {method_text} 단일 최대 적재량은 {capacity:,}개입니다. "
+                    f"요청 {requested_single_count:,}개 중 {completed_containers:,}대는 최대 적재로 처리하고, "
+                    f"마지막 컨테이너 {visible_count:,}개 적재 상태를 표시합니다."
+                )
+            else:
+                st.info(
+                    f"{selected} {method_text} 단일 최대 적재량은 {capacity:,}개입니다. "
+                    f"요청 {requested_single_count:,}개 적재 상태를 표시합니다."
+                )
+    st.plotly_chart(build_3d(container, placements, title, container_count), use_container_width=True)
     st.markdown(f"<div class='small-note'>표시 타이어 수: {len(placements):,}개</div>", unsafe_allow_html=True)
 
 with tabs[1]:

@@ -621,6 +621,7 @@ def fill_remaining_space(
     anchor_placements: Optional[List[Dict[str, object]]] = None,
     stack_height_limit: Optional[float] = None,
     allowed_support_block_ids: Optional[set] = None,
+    include_standing_extras_in_scan: bool = False,
 ) -> List[Dict[str, object]]:
     generator = generate_flat_placements if method == "flat" else generate_honeycomb_placements
     anchors = anchor_placements if anchor_placements is not None else placed
@@ -652,7 +653,7 @@ def fill_remaining_space(
                     max_count=None,
                     block_id=block_id,
                     block_axis=layout_axis,
-                    include_standing_extras=False,
+                    include_standing_extras=include_standing_extras_in_scan,
                 ))
     else:
         anchor_starts = sorted({
@@ -680,7 +681,7 @@ def fill_remaining_space(
                     max_count=None,
                     block_id=block_id,
                     block_axis=layout_axis,
-                    include_standing_extras=False,
+                    include_standing_extras=include_standing_extras_in_scan,
                 ))
     if layout_axis == "x" and allow_vertical_mix and anchor_placements:
         direct_anchor_candidates = []
@@ -835,6 +836,92 @@ def estimate_count_stack_span(
     return container.length_mm
 
 
+def generate_overflow_containers(
+    container: Container,
+    method: str,
+    clearance_mm: float,
+    requests: List[Dict[str, object]],
+    layout_axis: str = "x",
+) -> Tuple[List[Dict[str, object]], pd.DataFrame, int]:
+    overflow_placements: List[Dict[str, object]] = []
+    overflow_rows = []
+    remaining = [
+        {"idx": int(item["idx"]), "tire": item["tire"], "count": int(item["count"])}
+        for item in requests
+        if int(item.get("count", 0)) > 0
+    ]
+    container_no = 2
+    container_span = container.length_mm if layout_axis == "x" else container.height_mm
+
+    while remaining:
+        placed: List[Dict[str, object]] = []
+        previous_block_placements: List[Dict[str, object]] = []
+        current_pos = 0.0
+        next_remaining = []
+        placed_in_this_container = 0
+
+        for item in sorted(remaining, key=lambda row: (-int(row["count"]), int(row["idx"]))):
+            tire = item["tire"]
+            target_count = int(item["count"])
+            if target_count <= 0:
+                continue
+            block_id = f"C{container_no}_B{item['idx'] + 1}_{tire.spec}"
+            support_block_ids = {block_id}
+            support_block_ids.update(str(p["block_id"]) for p in previous_block_placements)
+            block_placements = fill_remaining_space(
+                container,
+                tire,
+                method,
+                clearance_mm,
+                placed,
+                target_count,
+                block_id,
+                layout_axis,
+                0.0,
+                container_span,
+                allow_vertical_mix=True,
+                anchor_placements=previous_block_placements if previous_block_placements else None,
+                allowed_support_block_ids=support_block_ids,
+                include_standing_extras_in_scan=bool(method == "flat" and not placed),
+            )
+            for p in block_placements:
+                p["container_no"] = container_no
+                if block_placements:
+                    p["block_start_x"] = min(float(q["bbox_x0"]) for q in block_placements)
+                    p["block_end_x"] = max(float(q["bbox_x1"]) for q in block_placements)
+                    p["block_start_z"] = min(float(q["bbox_z0"]) for q in block_placements)
+                    p["block_end_z"] = max(float(q["bbox_z1"]) for q in block_placements)
+            placed.extend(block_placements)
+            previous_block_placements = block_placements
+            placed_count = len(block_placements)
+            placed_in_this_container += placed_count
+            remainder = target_count - placed_count
+            overflow_rows.append({
+                "container_no": container_no,
+                "tire_spec": tire.spec,
+                "loading_method": method,
+                "requested_count": target_count,
+                "count": placed_count,
+                "unplaced_count": max(0, remainder),
+                "unused_space_reason": "추가 컨테이너 잔량 적재" if placed_count else "추가 컨테이너에 배치 가능한 좌표 없음",
+            })
+            if remainder > 0:
+                next_remaining.append({"idx": item["idx"], "tire": tire, "count": remainder})
+            if placed:
+                current_pos = max(float(p["bbox_x1"]) for p in placed) + clearance_mm
+                if current_pos >= container_span:
+                    current_pos = container_span
+
+        overflow_placements.extend(placed)
+        if placed_in_this_container == 0:
+            break
+        remaining = next_remaining
+        container_no += 1
+
+    unplaced_after_overflow = sum(int(item["count"]) for item in remaining)
+    return overflow_placements, pd.DataFrame(overflow_rows), unplaced_after_overflow
+
+
 def calculate_mixed_loading(
     container: Container,
     tires: List[Tire],
@@ -847,21 +934,85 @@ def calculate_mixed_loading(
     generator = generate_flat_placements if method == "flat" else generate_honeycomb_placements
     placements: List[Dict[str, object]] = []
     rows = []
+    overflow_requests: List[Dict[str, object]] = []
     current_pos = 0.0
     previous_block_placements: List[Dict[str, object]] = []
     allocation_mode_text = allocation_mode.lower()
     is_ratio_mode = "%" in allocation_mode
     is_length_mode = "mm" in allocation_mode_text or "길" in allocation_mode or "높" in allocation_mode or "length" in allocation_mode_text or "height" in allocation_mode_text
     is_count_mode = not is_ratio_mode and not is_length_mode
-    positive_count = max(0, sum(1 for v in allocations if v > 0))
     positive_total = sum(float(v) for v in allocations if float(v) > 0)
-    total_gap_budget = max(0, positive_count - 1) * clearance_mm
     container_span = container.length_mm if layout_axis == "x" else container.height_mm
+    positive_count = max(0, sum(1 for v in allocations if v > 0))
+    total_gap_budget = max(0, positive_count - 1) * clearance_mm
     available_span = max(0.0, container_span - total_gap_budget)
+    dedicated_loaded_total = 0
+    if is_count_mode:
+        capacity_func = calculate_flat_loading if method == "flat" else calculate_honeycomb_loading
+        work_items = []
+        for idx, tire in enumerate(tires):
+            requested_count = int(float(allocations[idx])) if idx < len(allocations) else 0
+            if requested_count <= 0:
+                continue
+            single_capacity = int(capacity_func(container, tire, clearance_mm)["count"])
+            dedicated_container_count = requested_count // single_capacity if single_capacity > 0 else 0
+            mixed_requested_count = requested_count % single_capacity if single_capacity > 0 else requested_count
+            dedicated_count = dedicated_container_count * single_capacity
+            dedicated_loaded_total += dedicated_count
+            work_items.append({
+                "idx": idx,
+                "tire": tire,
+                "value": float(mixed_requested_count),
+                "original_requested_count": requested_count,
+                "single_capacity": single_capacity,
+                "dedicated_container_count": dedicated_container_count,
+                "dedicated_count": dedicated_count,
+                "mixed_requested_count": mixed_requested_count,
+            })
+        work_items.sort(key=lambda item: (-int(item["mixed_requested_count"]), int(item["idx"])))
+    else:
+        work_items = [
+            {
+                "idx": idx,
+                "tire": tire,
+                "value": float(allocations[idx]) if idx < len(allocations) else 0.0,
+                "original_requested_count": None,
+                "single_capacity": None,
+                "dedicated_container_count": 0,
+                "dedicated_count": 0,
+                "mixed_requested_count": None,
+            }
+            for idx, tire in enumerate(tires)
+        ]
 
-    for idx, tire in enumerate(tires):
-        value = float(allocations[idx]) if idx < len(allocations) else 0.0
+    for item in work_items:
+        idx = int(item["idx"])
+        tire = item["tire"]
+        value = float(item["value"])
         if value <= 0:
+            if is_count_mode and int(item["original_requested_count"]) > 0:
+                rows.append({
+                    "tire_spec": tire.spec,
+                    "loading_method": method,
+                    "layout_axis": "가로구역(X)" if layout_axis == "x" else "세로층(Z)",
+                    "assigned_length_mm": 0.0 if layout_axis == "x" else container.length_mm,
+                    "assigned_height_mm": 0.0 if layout_axis == "z" else container.height_mm,
+                    "block_start_x": round(current_pos, 1) if layout_axis == "x" else 0,
+                    "block_end_x": round(current_pos, 1) if layout_axis == "x" else container.length_mm,
+                    "block_start_z": round(current_pos, 1) if layout_axis == "z" else 0,
+                    "block_end_z": round(current_pos, 1) if layout_axis == "z" else 0,
+                    "original_requested_count": int(item["original_requested_count"]),
+                    "single_spec_capacity": int(item["single_capacity"]),
+                    "dedicated_container_count": int(item["dedicated_container_count"]),
+                    "dedicated_count": int(item["dedicated_count"]),
+                    "mixed_requested_count": 0,
+                    "requested_count": 0,
+                    "count": 0,
+                    "unplaced_count": 0,
+                    "used_volume": 0.0,
+                    "utilization_rate": 0,
+                    "unused_space_reason": "단일 규격 최대 적재량 단위로 단독 컨테이너 분리, 혼적 잔량 없음",
+                })
             continue
         block_start = current_pos
         max_count: Optional[int] = None
@@ -909,6 +1060,7 @@ def calculate_mixed_loading(
             allow_vertical_mix=is_count_mode,
             anchor_placements=previous_block_placements if previous_block_placements else None,
             allowed_support_block_ids=support_block_ids,
+            include_standing_extras_in_scan=bool(is_count_mode and method == "flat" and not placements),
         )
         if block_placements:
             block_end_x = actual_block_end(block_placements, 0)
@@ -921,6 +1073,7 @@ def calculate_mixed_loading(
             block_start_x = block_start if layout_axis == "x" else 0
             block_start_z = block_start if layout_axis == "z" else 0
         for p in block_placements:
+            p["container_no"] = 1
             p["block_start_x"] = block_start_x
             p["block_end_x"] = block_end_x
             p["block_start_z"] = block_start_z
@@ -932,6 +1085,16 @@ def calculate_mixed_loading(
             if layout_axis == "x"
             else container.length_mm * container.width_mm * assigned_span
         )
+        requested_count = int(max_count) if max_count is not None else len(block_placements)
+        unplaced_count = max(0, requested_count - len(block_placements)) if is_count_mode else 0
+        if is_count_mode and unplaced_count > 0:
+            overflow_requests.append({"idx": idx, "tire": tire, "count": unplaced_count})
+        if unplaced_count:
+            unused_space_reason = "단독 컨테이너 분리 후 혼적 잔량 중 일부가 남은 좌표에 들어가지 않음"
+        elif block_placements:
+            unused_space_reason = "이전 규격 placement와 충돌하지 않는 남은 좌표를 순차 스캔함"
+        else:
+            unused_space_reason = "목표 수량 또는 할당 용량에 넣을 수 있는 남은 좌표 없음"
         rows.append({
             "tire_spec": tire.spec,
             "loading_method": method,
@@ -942,10 +1105,17 @@ def calculate_mixed_loading(
             "block_end_x": round(block_end_x, 1),
             "block_start_z": round(block_start_z, 1),
             "block_end_z": round(block_end_z, 1),
+            "original_requested_count": int(item["original_requested_count"]) if is_count_mode else None,
+            "single_spec_capacity": int(item["single_capacity"]) if is_count_mode else None,
+            "dedicated_container_count": int(item["dedicated_container_count"]) if is_count_mode else 0,
+            "dedicated_count": int(item["dedicated_count"]) if is_count_mode else 0,
+            "mixed_requested_count": requested_count if is_count_mode else None,
+            "requested_count": requested_count,
             "count": len(block_placements),
+            "unplaced_count": unplaced_count,
             "used_volume": round(used_volume, 1),
             "utilization_rate": round(used_volume / assigned_volume, 4) if assigned_volume else 0,
-            "unused_space_reason": "이전 규격 placement와 충돌하지 않는 남은 좌표를 순차 스캔함" if block_placements else "목표 수량 또는 할당 용량에 넣을 수 있는 남은 좌표 없음",
+            "unused_space_reason": unused_space_reason,
         })
         placements.extend(block_placements)
         previous_block_placements = block_placements
@@ -1029,8 +1199,34 @@ def calculate_mixed_loading(
         current_pos = block_end + clearance_mm
         if current_pos >= container_span:
             break
+    overflow_placements: List[Dict[str, object]] = []
+    overflow_table = pd.DataFrame()
+    unplaced_after_overflow = sum(int(item["count"]) for item in overflow_requests)
+    if is_count_mode and overflow_requests:
+        overflow_placements, overflow_table, unplaced_after_overflow = generate_overflow_containers(
+            container,
+            method,
+            clearance_mm,
+            overflow_requests,
+            layout_axis,
+        )
     table = pd.DataFrame(rows)
-    return {"placements": placements, "table": table, "total_count": len(placements)}
+    overflow_count = len(overflow_placements)
+    return {
+        "placements": placements,
+        "overflow_placements": overflow_placements,
+        "overflow_table": overflow_table,
+        "table": table,
+        "total_count": len(placements),
+        "overflow_count": overflow_count,
+        "requested_total": int(positive_total) if is_count_mode else None,
+        "dedicated_loaded_total": int(dedicated_loaded_total) if is_count_mode else 0,
+        "loaded_total": int(dedicated_loaded_total + len(placements) + overflow_count) if is_count_mode else len(placements),
+        "unplaced_total": int(unplaced_after_overflow) if is_count_mode else 0,
+        "first_container_unplaced_total": int(sum(int(item["count"]) for item in overflow_requests)) if is_count_mode else 0,
+        "capacity_limited": bool(is_count_mode and dedicated_loaded_total > 0),
+        "capacity_reference_count": None,
+    }
 
 
 def validate_placements(
